@@ -1,45 +1,23 @@
-name: Deploy to Cloud Run
+name: Deploy PR Preview to Cloud Run
 
 on:
-  push:
+  pull_request:
+    types: [opened, synchronize, reopened]
     branches:
-      - dev
+      - dev # Trigger when PRs are made *against* the dev branch
 
 jobs:
-  merge-dev-to-main:
+  build-and-deploy-pr-preview:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # Fetch all history for merging
-
-      - name: Configure Git
-        run: |
-          git config user.name "GitHub Actions Bot"
-          git config user.email "actions@github.com"
-
-      - name: Switch to main and merge dev
-        run: |
-          git fetch origin main # Ensure main is up-to-date
-          git checkout main
-          git merge origin/dev --no-ff --allow-unrelated-histories -m "Merge dev into main" 
-          git push origin main
-
-  build-and-deploy:
-    needs: merge-dev-to-main # Run this job only after the merge is successful
-    runs-on: ubuntu-latest
-    permissions:
-      contents: "read"
-      id-token: "write" # Required for Workload Identity Federation
+      contents: "read" # Permission to read the repository contents
+      id-token: "write" # Permission to write OIDC token for GCP authentication
 
     steps:
-      - name: Checkout code
+      - name: Checkout PR head
         uses: actions/checkout@v4
         with:
-          ref: "main" # Checkout the main branch after merge
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Authenticate to Google Cloud
         uses: "google-github-actions/auth@v2"
@@ -52,23 +30,28 @@ jobs:
           project_id: "${{ secrets.GCP_PROJECT_ID }}"
 
       - name: Configure Docker
-        run: |-
+        run: |
           gcloud auth configure-docker gcr.io --quiet
-          gcloud auth configure-docker ${{ secrets.CLOUD_RUN_REGION }}-docker.pkg.dev --quiet # For Artifact Registry if used
+          gcloud auth configure-docker ${{ secrets.CLOUD_RUN_REGION }}-docker.pkg.dev --quiet
 
       - name: Build and Push Docker image to GCR
+        id: build-image
         env:
           PROJECT_ID: "${{ secrets.GCP_PROJECT_ID }}"
-          SERVICE_NAME: "${{ secrets.CLOUD_RUN_SERVICE_NAME }}"
-        run: |-
-          docker build -t "gcr.io/$PROJECT_ID/$SERVICE_NAME:${{ github.sha }}" .
-          docker push "gcr.io/$PROJECT_ID/$SERVICE_NAME:${{ github.sha }}"
+          # Using the same service name for the image base, but with a unique PR tag
+          IMAGE_BASENAME: "${{ secrets.CLOUD_RUN_SERVICE_NAME }}"
+        run: |
+          IMAGE_TAG="pr-${{ github.event.number }}-${{ github.event.pull_request.head.sha }}"
+          FULL_IMAGE_NAME="gcr.io/$PROJECT_ID/$IMAGE_BASENAME:$IMAGE_TAG"
+          echo "FULL_IMAGE_NAME=$FULL_IMAGE_NAME" >> $GITHUB_OUTPUT
+          docker build -t "$FULL_IMAGE_NAME" .
+          docker push "$FULL_IMAGE_NAME"
 
       - name: Deploy to Cloud Run
         uses: "google-github-actions/deploy-cloudrun@v2"
         with:
-          service: "${{ secrets.CLOUD_RUN_SERVICE_NAME }}"
+          service: "${{ secrets.CLOUD_RUN_SERVICE_NAME }}" # Deploying to your existing service
           region: "${{ secrets.CLOUD_RUN_REGION }}"
-          image: "gcr.io/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.CLOUD_RUN_SERVICE_NAME }}:${{ github.sha }}"
+          image: ${{ steps.build-image.outputs.FULL_IMAGE_NAME }} # Use the image built in the previous step
           project_id: "${{ secrets.GCP_PROJECT_ID }}"
           flags: "--allow-unauthenticated --port=80"
